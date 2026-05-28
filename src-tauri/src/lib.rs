@@ -1201,7 +1201,11 @@ fn get_secret(service: &str, account: &str) -> Result<String, String> {
     Entry::new(service, account)
         .map_err(|_| "Could not access secure credential storage.".to_string())?
         .get_password()
-        .map_err(|_| "Could not read API key from secure credential storage.".to_string())
+        .map_err(|err| {
+            format!(
+                "Could not read API key from secure credential storage ({err}). Remove this provider and reconnect it."
+            )
+        })
 }
 
 fn delete_secret(service: &str, account: &str) -> Result<(), String> {
