@@ -92,6 +92,9 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   if (command === "add_codex_provider") {
     throw new Error("Codex requires the desktop app. Run `npm run tauri:dev:msys` so QuotaTray can read ~/.codex/auth.json.");
   }
+  if (command === "add_opencode_go_provider") {
+    throw new Error("OpenCode Go requires the desktop app. Run `npm run tauri:dev:msys` so QuotaTray can read ~/.local/share/opencode/opencode.db.");
+  }
   if (command === "add_openai_provider") {
     void args;
     throw new Error("OpenAI requires the desktop app. Run `npm run tauri:dev:msys` for real API key validation.");
@@ -208,6 +211,20 @@ export function App() {
     }
   }
 
+  async function addOpenCodeGo() {
+    setRefreshing("add-opencode-go");
+    setError(null);
+    try {
+      await invoke("add_opencode_go_provider");
+      setPanel("dashboard");
+      await load();
+    } catch (err) {
+      setError(toMessage(err));
+    } finally {
+      setRefreshing(null);
+    }
+  }
+
   async function addOpenRouter(event: FormEvent) {
     event.preventDefault();
     if (!apiKey.trim()) return;
@@ -286,6 +303,7 @@ export function App() {
             addOpenRouter={addOpenRouter}
             addOpenAI={addOpenAI}
             addCodex={addCodex}
+            addOpenCodeGo={addOpenCodeGo}
             addMock={addMock}
             busy={refreshing}
           />
@@ -459,6 +477,7 @@ function AddProvider({
   addOpenRouter,
   addOpenAI,
   addCodex,
+  addOpenCodeGo,
   addMock,
   busy,
 }: {
@@ -469,6 +488,7 @@ function AddProvider({
   addOpenRouter: (event: FormEvent) => void;
   addOpenAI: (event: FormEvent) => void;
   addCodex: () => void;
+  addOpenCodeGo: () => void;
   addMock: () => void;
   busy: string | null;
 }) {
@@ -485,16 +505,29 @@ function AddProvider({
       </div>
 
       {authMode === "login" ? (
-        <section className="loginPanel">
-          <h2>Codex local login</h2>
-          <p>
-            Uses your existing Codex session from ~/.codex/auth.json. If the token is stale, QuotaTray will try to refresh it with the stored refresh token.
-          </p>
-          <button className="primaryButton" onClick={addCodex} disabled={!!busy} type="button">
-            {busy === "add-codex" ? <Loader2 className="spin" size={16} /> : <Plus size={16} />} Connect Codex
-          </button>
-          <p className="smallNote">For regular OpenAI API usage, switch to API key. ChatGPT web quota is not exposed as a general public API.</p>
-        </section>
+        <>
+          <section className="loginPanel">
+            <h2>Codex local login</h2>
+            <p>
+              Uses your existing Codex session from ~/.codex/auth.json. If the token is stale, QuotaTray will try to refresh it with the stored refresh token.
+            </p>
+            <button className="primaryButton" onClick={addCodex} disabled={!!busy} type="button">
+              {busy === "add-codex" ? <Loader2 className="spin" size={16} /> : <Plus size={16} />} Connect Codex
+            </button>
+            <p className="smallNote">For regular OpenAI API usage, switch to API key. ChatGPT web quota is not exposed as a general public API.</p>
+          </section>
+
+          <section className="loginPanel">
+            <h2>OpenCode Go local usage</h2>
+            <p>
+              Reads your local OpenCode history from ~/.local/share/opencode/opencode.db and estimates 5-hour, weekly, and monthly quota usage.
+            </p>
+            <button className="primaryButton" onClick={addOpenCodeGo} disabled={!!busy} type="button">
+              {busy === "add-opencode-go" ? <Loader2 className="spin" size={16} /> : <Plus size={16} />} Connect OpenCode Go
+            </button>
+            <p className="smallNote">This local monitor does not need your OpenCode Go password. Web subscription quota via cookies can be added later if needed.</p>
+          </section>
+        </>
       ) : null}
 
       {authMode === "api_key" ? <>
@@ -570,6 +603,7 @@ function EmptyState({ onAdd, onMock, busy }: { onAdd: () => void; onMock: () => 
 
 function ProviderIcon({ providerType }: { providerType: string }) {
   if (providerType === "codex") return <Bot size={22} />;
+  if (providerType === "opencode_go") return <Activity size={22} />;
   if (providerType === "openai") return <Bot size={22} />;
   if (providerType === "openrouter") return <CircleDollarSign size={22} />;
   if (providerType === "mock") return <Bot size={22} />;

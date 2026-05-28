@@ -1,4 +1,4 @@
-use chrono::{TimeZone, Utc};
+use chrono::{Datelike, TimeZone, Utc};
 use keyring::Entry;
 use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -107,6 +107,7 @@ pub fn run() {
             get_dashboard,
             add_mock_provider,
             add_codex_provider,
+            add_opencode_go_provider,
             add_openrouter_provider,
             add_openai_provider,
             refresh_all,
@@ -206,6 +207,29 @@ fn add_mock_provider(state: State<'_, AppState>) -> Result<(), String> {
 
     insert_snapshot(&conn, "mock-default", mock_snapshot())?;
     Ok(())
+}
+
+#[tauri::command]
+async fn add_opencode_go_provider(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = open_db(&state.db_path)?;
+    let now = now_iso();
+    conn.execute(
+        "INSERT OR IGNORE INTO providers
+        (id, provider_type, display_name, auth_type, keychain_service, keychain_account, enabled, created_at, updated_at)
+        VALUES (?1, 'opencode_go', 'OpenCode Go', 'local', NULL, NULL, 1, ?2, ?2)",
+        params!["opencode-go-local", now],
+    )
+    .map_err(db_error)?;
+
+    let row = ProviderRow {
+        id: "opencode-go-local".to_string(),
+        provider_type: "opencode_go".to_string(),
+        display_name: "OpenCode Go".to_string(),
+        auth_type: "local".to_string(),
+        keychain_service: None,
+        keychain_account: None,
+    };
+    refresh_provider_row(state.inner(), &row).await.map(|_| ())
 }
 
 #[tauri::command]
@@ -342,6 +366,7 @@ async fn refresh_provider_row(
     let snapshot = match row.provider_type.as_str() {
         "mock" => Ok(mock_snapshot()),
         "codex" => refresh_codex(state, row).await,
+        "opencode_go" => refresh_opencode_go().await,
         "openrouter" => refresh_openrouter(state, row).await,
         "openai" => refresh_openai(state, row).await,
         _ => Ok(UsageSnapshot {
@@ -385,6 +410,229 @@ async fn refresh_provider_row(
     } else {
         Ok(snapshot)
     }
+}
+
+async fn refresh_opencode_go() -> Result<UsageSnapshot, String> {
+    let (auth_path, db_path) = opencode_go_paths()?;
+    let has_auth = opencode_go_has_auth(&auth_path);
+    if !db_path.exists() {
+        if has_auth {
+            return Err(
+                "OpenCode Go local database was not found at ~/.local/share/opencode/opencode.db."
+                    .to_string(),
+            );
+        }
+        return Err(
+            "OpenCode Go was not detected. Sign in/use OpenCode Go locally first.".to_string(),
+        );
+    }
+
+    let conn = Connection::open(&db_path).map_err(|err| {
+        format!(
+            "Could not open OpenCode Go local database at {}: {}",
+            db_path.display(),
+            err
+        )
+    })?;
+    conn.busy_timeout(Duration::from_millis(250))
+        .map_err(db_error)?;
+
+    let rows = read_opencode_go_rows(&conn)?;
+    if !has_auth && rows.is_empty() {
+        return Err(
+            "OpenCode Go was not detected. Sign in/use OpenCode Go locally first.".to_string(),
+        );
+    }
+    if rows.is_empty() {
+        return Err("OpenCode Go local usage history has no rows yet.".to_string());
+    }
+
+    let now = Utc::now();
+    let now_ms = now.timestamp_millis();
+    let five_hours_ms = 5 * 60 * 60 * 1000_i64;
+    let week_ms = 7 * 24 * 60 * 60 * 1000_i64;
+    let session_start_ms = now_ms - five_hours_ms;
+    let weekday_offset = now.weekday().num_days_from_monday() as i64;
+    let week_start_date = now.date_naive() - chrono::Duration::days(weekday_offset);
+    let week_start_ms = week_start_date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|date| Utc.from_local_datetime(&date).single())
+        .map(|date| date.timestamp_millis())
+        .unwrap_or(now_ms - week_ms);
+    let week_end_ms = week_start_ms + week_ms;
+    let month_start_ms = Utc
+        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .map(|date| date.timestamp_millis())
+        .unwrap_or(now_ms);
+    let (next_month_year, next_month) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    let month_end_ms = Utc
+        .with_ymd_and_hms(next_month_year, next_month, 1, 0, 0, 0)
+        .single()
+        .map(|date| date.timestamp_millis())
+        .unwrap_or(month_start_ms + 30 * 24 * 60 * 60 * 1000_i64);
+
+    let session_cost = sum_opencode_go_cost(&rows, session_start_ms, now_ms);
+    let weekly_cost = sum_opencode_go_cost(&rows, week_start_ms, week_end_ms);
+    let monthly_cost = sum_opencode_go_cost(&rows, month_start_ms, month_end_ms);
+    let session_percent = percent(session_cost, 12.0);
+    let weekly_percent = percent(weekly_cost, 30.0);
+    let monthly_percent = percent(monthly_cost, 60.0);
+    let reset_ms = rows
+        .iter()
+        .filter(|row| row.created_ms >= session_start_ms && row.created_ms < now_ms)
+        .map(|row| row.created_ms)
+        .min()
+        .map(|oldest| oldest + five_hours_ms)
+        .unwrap_or(now_ms);
+    let reset_at = Utc
+        .timestamp_millis_opt(reset_ms)
+        .single()
+        .map(|date| date.to_rfc3339());
+
+    Ok(UsageSnapshot {
+        status: status_from_percentage(Some(session_percent)),
+        used: Some(session_percent),
+        limit_value: Some(100.0),
+        remaining: Some((100.0 - session_percent).max(0.0)),
+        percentage: Some(session_percent),
+        unit: "percentage".to_string(),
+        reset_at,
+        message: Some(format!(
+            "Local OpenCode Go estimate. 5h: {:.1}% (${:.2}/$12). Weekly: {:.1}% (${:.2}/$30). Monthly: {:.1}% (${:.2}/$60).",
+            session_percent, session_cost, weekly_percent, weekly_cost, monthly_percent, monthly_cost
+        )),
+        raw_json: Some(
+            json!({
+                "source": "local",
+                "rows": rows.len(),
+                "session_cost": session_cost,
+                "weekly_cost": weekly_cost,
+                "monthly_cost": monthly_cost,
+                "session_percent": session_percent,
+                "weekly_percent": weekly_percent,
+                "monthly_percent": monthly_percent
+            })
+            .to_string(),
+        ),
+        created_at: now_iso(),
+    })
+}
+
+#[derive(Debug)]
+struct OpenCodeGoRow {
+    created_ms: i64,
+    cost: f64,
+}
+
+fn opencode_go_paths() -> Result<(PathBuf, PathBuf), String> {
+    let home = dirs::home_dir()
+        .ok_or_else(|| "Could not locate home directory for OpenCode Go.".to_string())?;
+    let dir = home.join(".local").join("share").join("opencode");
+    Ok((dir.join("auth.json"), dir.join("opencode.db")))
+}
+
+fn opencode_go_has_auth(path: &PathBuf) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| {
+            value
+                .pointer("/opencode-go/key")
+                .and_then(Value::as_str)
+                .map(|key| !key.trim().is_empty())
+        })
+        .unwrap_or(false)
+}
+
+fn read_opencode_go_rows(conn: &Connection) -> Result<Vec<OpenCodeGoRow>, String> {
+    let sql = if sqlite_has_table(conn, "part")? {
+        "WITH message_costs AS (
+          SELECT
+            id AS messageID,
+            CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+            CAST(json_extract(data, '$.cost') AS REAL) AS cost
+          FROM message
+          WHERE json_valid(data)
+            AND json_extract(data, '$.providerID') = 'opencode-go'
+            AND json_extract(data, '$.role') = 'assistant'
+            AND json_type(data, '$.cost') IN ('integer', 'real')
+        )
+        SELECT createdMs, cost
+        FROM message_costs
+        UNION ALL
+        SELECT
+          CAST(COALESCE(json_extract(p.data, '$.time.created'), p.time_created, m.time_created) AS INTEGER) AS createdMs,
+          CAST(json_extract(p.data, '$.cost') AS REAL) AS cost
+        FROM part p
+        JOIN message m ON m.id = p.message_id
+        WHERE json_valid(p.data)
+          AND json_valid(m.data)
+          AND json_extract(p.data, '$.type') = 'step-finish'
+          AND json_type(p.data, '$.cost') IN ('integer', 'real')
+          AND json_extract(m.data, '$.providerID') = 'opencode-go'
+          AND json_extract(m.data, '$.role') = 'assistant'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM message_costs
+            WHERE message_costs.messageID = p.message_id
+          )"
+    } else {
+        "SELECT
+          CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+          CAST(json_extract(data, '$.cost') AS REAL) AS cost
+        FROM message
+        WHERE json_valid(data)
+          AND json_extract(data, '$.providerID') = 'opencode-go'
+          AND json_extract(data, '$.role') = 'assistant'
+          AND json_type(data, '$.cost') IN ('integer', 'real')"
+    };
+
+    let mut stmt = conn.prepare(sql).map_err(db_error)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(OpenCodeGoRow {
+                created_ms: row.get(0)?,
+                cost: row.get(1)?,
+            })
+        })
+        .map_err(db_error)?;
+
+    rows.filter_map(|row| match row {
+        Ok(row) if row.created_ms > 0 && row.cost.is_finite() && row.cost >= 0.0 => Some(Ok(row)),
+        Ok(_) => None,
+        Err(err) => Some(Err(db_error(err))),
+    })
+    .collect()
+}
+
+fn sqlite_has_table(conn: &Connection, table: &str) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1 LIMIT 1",
+        params![table],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|value| value.is_some())
+    .map_err(db_error)
+}
+
+fn sum_opencode_go_cost(rows: &[OpenCodeGoRow], start_ms: i64, end_ms: i64) -> f64 {
+    rows.iter()
+        .filter(|row| row.created_ms >= start_ms && row.created_ms < end_ms)
+        .map(|row| row.cost)
+        .sum()
+}
+
+fn percent(used: f64, limit: f64) -> f64 {
+    if !used.is_finite() || limit <= 0.0 {
+        return 0.0;
+    }
+    ((used / limit * 100.0).clamp(0.0, 100.0) * 10.0).round() / 10.0
 }
 
 async fn refresh_codex(state: &AppState, _row: &ProviderRow) -> Result<UsageSnapshot, String> {

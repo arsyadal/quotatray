@@ -22,6 +22,7 @@ Current implementation:
 | Provider | Auth | Status |
 |---|---|---|
 | Codex | Local Codex session from `~/.codex/auth.json` | Implemented |
+| OpenCode Go | Local usage database from `~/.local/share/opencode/opencode.db` | Implemented local estimate |
 | OpenAI / GPT | API key from `platform.openai.com` | Implemented validation |
 | OpenRouter | API key | Implemented |
 | Mock Provider | None | Implemented |
@@ -37,6 +38,22 @@ QuotaTray can reuse an existing local Codex login:
 It reads the local Codex OAuth token and calls the Codex usage endpoint. If the access token is stale, QuotaTray attempts to refresh it using the stored refresh token.
 
 > Codex quota reading only works in the Tauri desktop app, not in browser preview mode.
+
+### OpenCode Go provider
+
+QuotaTray can read local OpenCode Go usage from:
+
+```txt
+~/.local/share/opencode/opencode.db
+```
+
+It estimates:
+
+- 5-hour usage against a `$12` local limit
+- Weekly usage against a `$30` local limit
+- Monthly usage against a `$60` local limit
+
+This is currently a local estimate based on OpenCode message cost history. Web subscription quota via session cookies can be added later.
 
 ### OpenAI / GPT provider
 
@@ -179,9 +196,10 @@ Early MVP / prototype.
 Primary focus:
 
 1. Stable Codex usage reading
-2. OpenAI/OpenRouter API key provider flows
-3. Responsive tray popover UI
-4. Cross-platform packaging
+2. OpenCode Go local usage monitoring
+3. OpenAI/OpenRouter API key provider flows
+4. Responsive tray popover UI
+5. Cross-platform packaging
 
 ## License
 
